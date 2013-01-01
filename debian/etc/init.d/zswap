@@ -1,0 +1,250 @@
+#!/bin/bash
+### BEGIN INIT INFO
+# Provides:          zswap
+# Required-Start:    $syslog
+# Required-Stop:     $syslog
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description:       Activate compressed swap
+### END INIT INFO
+#
+#
+# Version:	1.0 john.r.moser@gmail.com
+#
+
+# Changelog:
+# v1.1:
+#   - Detect multi-core and use multiple threads via interleaving
+#   - Reorder some of the start routine to do nothing until late
+
+#
+# It's also possible to resize the zswap by device hopping, i.e.
+# making a new one on /dev/zram1, swapon /dev/zram1, and then
+# swapoff /dev/zram0.  This would be CPU intensive...
+#
+
+PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+DESC="Sets up compressed swap"
+NAME=zswap
+SCRIPTNAME=/etc/init.d/$NAME
+
+# Default value
+MULTITHREAD=1
+ZRAM_NUM_DEVICES=4
+ZSWAP_DEVICE="zram0"
+ZSWAP_SIZE="quarter"
+
+# Read config file if it is present.
+if [ -r /etc/default/$NAME ]; then
+	. /etc/default/$NAME
+fi
+
+# Gracefully exit if disabled
+[ "$ZSWAP_DISABLED" = "1" ] && exit 0
+
+is_numeric() {
+	echo "$@" | grep -q -v "[^0-9]"
+}
+
+get_num_cores() {
+	awk '/^processor/{f=$3} END{print f+1}' /proc/cpuinfo
+}
+
+# Disable multithreading if on one CPU
+if [ "${MULTITHREAD}" = "1" ]; then
+	NUM_CPUS=$(get_num_cores)
+	if [ "${NUM_CPUS}" = "1" ]; then
+		MULTITHREAD=0
+	fi
+fi
+
+#Takes:
+# zswap_to_bytes 524288
+# zswap_to_bytes 512K
+# zswap_to_bytes 128M
+# zswap_to_bytes 2G
+# otherwise formed parameters are errors.
+zswap_to_bytes() {
+	MODIFIER="${1: -1}"
+	ZR_SIZE="${1:0:-1}"
+
+	# Numeric:  just pass as-is
+	if ( is_numeric ${1} ) ; then
+		echo ${1}
+		return 0
+	fi
+
+	# If size isn't a number,
+	if ! ( is_numeric ${ZR_SIZE} ) ; then
+		echo "0"
+		return 1
+	fi
+
+	if [ "${MODIFIER}" = "K" ]; then
+		ZR_SIZE=$(( ZR_SIZE * 1024 ))
+	elif [ "${MODIFIER}" = "M" ]; then
+		ZR_SIZE=$(( ZR_SIZE * 1024 * 1024 ))
+	elif [ "${MODIFIER}" = "G" ]; then
+		ZR_SIZE=$(( ZR_SIZE * 1024 * 1024 * 1024 ))
+	elif [ ! is_numeric "${MODIFIER}" ]; then
+		echo "0"
+		return 1
+	fi
+	echo $ZR_SIZE
+}
+
+#
+#	Function that starts the daemon/service.
+#
+d_start_multithread() {
+	# Two loops because the first is a sanity check
+	for i in `seq 0 $((NUM_CPUS - 1))`; do
+		if [ "$(cat /sys/block/zram${i}/disksize)" != "0" ]; then
+			echo "Device zram${i} in use!"
+			return 1
+		fi
+	done
+	# split up the size
+	ZSWAP_SIZE=$((ZSWAP_SIZE / NUM_CPUS))
+	# Initialize
+	for i in `seq 0 $((NUM_CPUS - 1))`; do
+		echo "Initializing /dev/zram${i}..."
+		echo $ZSWAP_SIZE > /sys/block/zram${i}/disksize
+		mkswap /dev/zram${i}
+		swapon -p 32767 /dev/zram${i}
+	done
+}
+
+d_start() {
+	ZSWAP_LOADED=0
+	if [ "${MULTITHREAD}" = "1" ]; then
+		ZSWAP_DEVICE="zram"
+	fi
+	swapon -s | cut -f 1 | grep -q "/dev/${ZSWAP_DEVICE}" && ZSWAP_LOADED=1
+	if [ "${ZSWAP_LOADED}" -eq "1" ]; then
+		echo "zswap already in use"
+		return 1
+	fi
+
+	# Override ZRAM_NUM_DEVICES if multithreading
+	if [ "${MULTITHREAD}" = "1" ]; then
+		echo "Creating multi-threaded zswap for $((NUM_CPUS)) cores..."
+		ZRAM_NUM_DEVICES=$((ZRAM_NUM_DEVICES + NUM_CPUS))
+		ZSWAP_DEVICE="zram$((NUM_CPUS - 1))"
+	fi
+
+	# half or quarter size
+	# Around 4G, awk starts spitting out 1.0e8 etc, which is no
+	# good.  This division allows for 2 terabytes RAM.
+	if [ "${ZSWAP_SIZE}" = "half" ]; then
+		ZSWAP_SIZE="$(awk '/^MemTotal:/{f=$2} END{print f / 2048}' /proc/meminfo | cut -f 1 -d'.')M"
+	elif [ "${ZSWAP_SIZE}" = "quarter" ]; then
+		ZSWAP_SIZE="$(awk '/^MemTotal:/{f=$2} END{print f / 4096}' /proc/meminfo | cut -f 1 -d'.')M"
+	fi
+	ZSWAP_SIZE=$( zswap_to_bytes $ZSWAP_SIZE )
+	if [ "${ZSWAP_SIZE}" = "0" ]; then
+		echo "Invalid ZSWAP_SIZE"
+		return 1
+	fi
+
+	# this parameter name keeps changing with new kernel versions
+	modprobe zram num_devices=${ZRAM_NUM_DEVICES}
+
+	# Does it now exist?
+	if [ ! -b /dev/${ZSWAP_DEVICE} ]; then
+		echo "/dev/${ZSWAP_DEVICE} does not exist!"
+		return 1
+	fi
+
+	# if we're multi-threading, use device mapper to raid
+	if [ "${MULTITHREAD}" = "1" ]; then
+		d_start_multithread || return $?
+	else
+		echo $ZSWAP_SIZE > /sys/block/${ZSWAP_DEVICE}/disksize
+		mkswap /dev/${ZSWAP_DEVICE}
+		swapon /dev/${ZSWAP_DEVICE}
+	fi
+}
+
+#
+#	Function that stops the daemon/service.
+#
+d_stop_multithread() {
+	for i in `seq 0 $((NUM_CPUS - 1))`; do
+		ZSWAP_DEVICE="zram${i}"
+		if ! ( swapoff /dev/${ZSWAP_DEVICE} ); then
+			echo "Cannot de-activate compressed swap /dev/${ZSWAP_DEVICE}!"
+			return 1
+		fi
+		echo "Clearing /dev/${ZSWAP_DEVICE}..."
+		echo 1 > /sys/block/${ZSWAP_DEVICE}/reset
+	done
+}
+
+d_stop() {
+	ZSWAP_LOADED=0
+	if [ "${MULTITHREAD}" = "1" ]; then
+		ZSWAP_DEVICE="zram"
+	fi	
+
+	swapon -s | cut -f 1 | grep -q "/dev/${ZSWAP_DEVICE}" && ZSWAP_LOADED=1
+	if [ "${ZSWAP_LOADED}" != "1" ]; then
+		echo "zswap not in use"
+		return 1
+	fi
+
+	if [ "${MULTITHREAD}" = "1" ]; then
+		d_stop_multithread || return $?
+		ZSWAP_DEVICE="zswap"
+	elif ! ( swapoff /dev/${ZSWAP_DEVICE} ); then
+		echo "Cannot de-activate compressed swap /dev/${ZSWAP_DEVICE}!"
+		return 1
+	fi
+
+	# Double check this
+	ZSWAP_LOADED=0
+	swapon -s | cut -f 1 | grep -q "/dev/${ZSWAP_DEVICE}" && ZSWAP_LOADED=1
+	if [ "${ZSWAP_LOADED}" = "1" ]; then
+		echo "zswap /dev/${ZSWAP_DEVICE} did not de-activate!"
+		return 1
+	fi
+
+	if [ "${MULTITHREAD}" != "1" ]; then
+		# free the block device's memory
+		echo 1 > /sys/block/${ZSWAP_DEVICE}/reset
+	fi
+	modprobe -r zram
+}
+
+
+case "$1" in
+  start)
+
+	echo -n "Starting $DESC: $NAME"
+	d_start
+	echo "."
+	;;
+  stop)
+	echo -n "Stopping $DESC: $NAME"
+	d_stop
+	echo "."
+	;;
+  #reload)
+	#
+	#	No reload target
+	#
+  #;;
+  restart|force-reload)
+	echo -n "Restarting $DESC: $NAME"
+	d_stop
+	#sleep 1
+	d_start
+	echo "."
+	;;
+  *)
+	echo "Usage: $SCRIPTNAME {start|stop|restart|force-reload}" >&2
+	exit 1
+	;;
+esac
+
+exit 0

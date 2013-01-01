@@ -1,0 +1,2 @@
+ZSWAP_SIZE="half"
+#ZRAM_NUM_DEVICES=1
